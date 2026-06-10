@@ -1,0 +1,90 @@
+name: Auto Update Clash Config
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Job 1: 检查更新 (不再等待)
+  check-for-update:
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.check.outputs.has_update }}
+      latest_sha: ${{ steps.check.outputs.latest_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # *** 核心修改：移除了所有 sleep 和 for 循环 ***
+      - name: Instantly check for updates
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="TopChina"
+          REPO="proxy-list"
+          FILE_PATH="README.md"
+          STATE_FILE="upstream_commit.sha"
+          API_URL="https://api.github.com/repos/${OWNER}/${REPO}/commits?path=${FILE_PATH}&per_page=1"
+
+          # 1. 读取本地记录的 SHA
+          PREVIOUS_SHA=""
+          if [ -f "$STATE_FILE" ]; then
+            PREVIOUS_SHA=$(cat "$STATE_FILE")
+          fi
+          echo "Previous recorded SHA: ${PREVIOUS_SHA:-'None'}"
+
+          # 2. 立即获取上游最新的 SHA (禁用缓存)
+          LATEST_SHA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" -H "Cache-Control: no-cache" "${API_URL}" | jq -r '.[0].sha')
+          if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" == "null" ]; then
+            echo "::error::Could not fetch latest commit SHA from upstream."
+            exit 1
+          fi
+          echo "Latest upstream SHA: $LATEST_SHA"
+
+          # 3. 直接比较，不再等待
+          if [ "$LATEST_SHA" != "$PREVIOUS_SHA" ]; then
+            echo "✅ New update found! SHA: $LATEST_SHA"
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "latest_sha=${LATEST_SHA}" >> $GITHUB_OUTPUT
+          else
+            echo "No update found at this moment. Exiting."
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          fi
+          
+  # Job 2: 执行更新和提交 (此部分无需改动)
+  update-and-commit:
+    needs: check-for-update
+    if: needs.check-for-update.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Create/Update state file
+        run: echo "${{ needs.check-for-update.outputs.latest_sha }}" > upstream_commit.sha
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Run the update script
+        run: python 1.py
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: '🎉 Auto-update config from upstream commit ${{ needs.check-for-update.outputs.latest_sha }}'
+          file_pattern: '1.yaml upstream_commit.sha'
